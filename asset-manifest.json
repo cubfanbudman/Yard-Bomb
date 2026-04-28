@@ -1,0 +1,15 @@
+{
+  "files": {
+    "main.css": "/Yard-Bomb/static/css/main.e6c13ad2.css",
+    "main.js": "/Yard-Bomb/static/js/main.d786e6a4.js",
+    "static/js/453.7e974556.chunk.js": "/Yard-Bomb/static/js/453.7e974556.chunk.js",
+    "index.html": "/Yard-Bomb/index.html",
+    "main.e6c13ad2.css.map": "/Yard-Bomb/static/css/main.e6c13ad2.css.map",
+    "main.d786e6a4.js.map": "/Yard-Bomb/static/js/main.d786e6a4.js.map",
+    "453.7e974556.chunk.js.map": "/Yard-Bomb/static/js/453.7e974556.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.e6c13ad2.css",
+    "static/js/main.d786e6a4.js"
+  ]
+}
