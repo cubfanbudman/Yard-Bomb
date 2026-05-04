@@ -52,9 +52,9 @@ const PARK_FACTORS = {
   'loanDepot park':           0.85,
   'Fenway Park':              0.84,
   // Kauffman Stadium: fences moved in 8-10 ft and lowered from 18.5 ft to 8.5 ft for 2026.
-  // Royals through ~3 weeks: 9 HR in 11 home games (0.82/g) vs 9 HR in 12 away (0.75/g) → ~1.09 ratio.
-  // Bumped 0.97 → 1.02 on 2026-04-21; revisit once full-season data available.
-  'Kauffman Stadium':         1.02,
+  // Royals through ~5 weeks: 18 HR in 16 home games (1.125/g) vs 15 HR in 18 away (0.833/g) → ~1.35 ratio.
+  // Bumped 1.02 → 1.10 on 2026-05-04; revisit mid-June with 40+ home games.
+  'Kauffman Stadium':         1.10,
   'PNC Park':                 0.83,
   'Oracle Park':              0.76,
 };
@@ -85,15 +85,9 @@ function localDateStr(date = new Date()) {
 }
 
 const TODAY = localDateStr();
-
-function cacheGet(key) {
-  try {
-    const raw = localStorage.getItem(`yardbomb_${key}_${TODAY}`);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
+// Days since April 1 (approximate season start) — drives the accuracy history window
+// so it grows naturally with the season rather than being hard-capped.
+const SEASON_DAYS_ELAPSED = Math.max(1, Math.ceil((new Date() - new Date(SEASON, 3, 1)) / 86400000));
 
 function cacheSet(key, data) {
   try {
@@ -1650,7 +1644,7 @@ function TabYesterday({ statcastMap }) {
     fetchYesterdayResults(statcastMap, setProgressMsg)
       .then((data) => {
         setState(data);
-        setAccuracyHistory(loadAccuracyHistory(30));
+        setAccuracyHistory(loadAccuracyHistory(SEASON_DAYS_ELAPSED));
         setLoading(false);
         setProgressMsg('');
       })
@@ -1671,7 +1665,7 @@ function TabYesterday({ statcastMap }) {
         if (!localStorage.getItem(`yardbomb_acc_${ds}`)) {
           try {
             await fetchYesterdayResults(statcastMap, null, i);
-            if (!cancelled) setAccuracyHistory(loadAccuracyHistory(30));
+            if (!cancelled) setAccuracyHistory(loadAccuracyHistory(SEASON_DAYS_ELAPSED));
           } catch { /* ignore — day may have no games */ }
         }
       }
