@@ -131,7 +131,8 @@ function cachePrune() {
         !k.endsWith(TODAY) &&
         !k.endsWith(YESTERDAY) &&
         !k.startsWith('yardbomb_acc_') &&
-        !k.startsWith('yardbomb_yday_')
+        !k.startsWith('yardbomb_yday_') &&
+        !k.startsWith('yardbomb_snap_')
       )
       .forEach((k) => localStorage.removeItem(k));
   } catch { /* ignore */ }
@@ -159,6 +160,27 @@ function loadAccuracyHistory(days = 14) {
     } catch { /* skip */ }
   }
   return records; // chronological: oldest first, yesterday last
+}
+
+// Save a snapshot of today's scored batters so tomorrow's Yesterday tab reflects
+// what the app actually showed (including players who later get scratched).
+function saveTodaySnapshot(allBatters) {
+  if (!allBatters || allBatters.length === 0) return;
+  const key = `yardbomb_snap_${TODAY}`;
+  try {
+    const picks = allBatters.map((b) => ({
+      id: b.id, name: b.name, position: b.position,
+      teamName: b.teamName, awayName: b.awayName ?? '', homeName: b.homeName ?? '',
+      venue: b.venue, total: b.total, grade: b.grade,
+      power: b.power, pitcherVuln: b.pitcherVuln, parkFactor: b.parkFactor,
+      hotStreak: b.hotStreak, platoon: b.platoon,
+      homeRuns: b.homeRuns, avg: b.avg, slg: b.slg, atBats: b.atBats,
+    }));
+    localStorage.setItem(key, JSON.stringify({
+      picks,
+      savedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    }));
+  } catch { /* storage full or unavailable */ }
 }
 
 function gradeInfo(score) {
@@ -521,7 +543,7 @@ async function fetchHotStreak(playerId) {
     const recentBA = weightedH / weightedAB;
     const avgScore = clamp(recentBA / (2 * LEAGUE_AVG_BA));
 
-    const score = hrScore * 0.65 + avgScore * 0.35;
+    const score = hrScore * 0.45 + avgScore * 0.55;
     return { score, recentHR, recentGames: recent.length };
   } catch {
     return { score: 0.5, recentHR: null, recentGames: null };
@@ -988,8 +1010,8 @@ function TabTopPicks({ gameResults, games }) {
       const homePitcherName = game.teams?.home?.probablePitcher?.fullName ?? null;
       if (awayName) teams.add(awayName);
       if (homeName) teams.add(homeName);
-      result.away.forEach((b) => batters.push({ ...b, venue, teamName: awayName, gamePk: game.gamePk, oppPitcherName: homePitcherName }));
-      result.home.forEach((b) => batters.push({ ...b, venue, teamName: homeName, gamePk: game.gamePk, oppPitcherName: awayPitcherName }));
+      result.away.forEach((b) => batters.push({ ...b, venue, teamName: awayName, awayName, homeName, gamePk: game.gamePk, oppPitcherName: homePitcherName }));
+      result.home.forEach((b) => batters.push({ ...b, venue, teamName: homeName, awayName, homeName, gamePk: game.gamePk, oppPitcherName: awayPitcherName }));
     });
     batters.sort((a, b) => b.total - a.total);
     return { allBatters: batters, loadedCount: loaded, teamNames: [...teams].sort() };
@@ -1018,6 +1040,10 @@ function TabTopPicks({ gameResults, games }) {
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filtered.slice(0, 20).map((b) => `${b.id}_${b.oppPitcherId}`).join(',')]);
+
+  useEffect(() => {
+    if (allBatters.length > 0) saveTodaySnapshot(allBatters);
+  }, [allBatters]);
 
   if (allBatters.length === 0) {
     return (
@@ -1405,7 +1431,11 @@ async function fetchYesterdayResults(statcastMap = null, onProgress = null, days
     const raw = localStorage.getItem(ydayCacheKey);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return { ...parsed, hrIds: new Set(parsed.hrIds) };
+      return {
+        ...parsed,
+        hrIds:      new Set(parsed.hrIds),
+        hrCountMap: new Map(parsed.hrCountMap ?? []),
+      };
     }
   } catch { /* ignore — fall through to fetch */ }
 
@@ -1512,8 +1542,9 @@ async function fetchYesterdayResults(statcastMap = null, onProgress = null, days
   onProgress?.('Scoring batters…');
 
   // Build scored picks from every batter in every batting order
-  const hrIds   = new Set();
-  const allRows = [];
+  const hrIds      = new Set();
+  const hrCountMap = new Map(); // player id → HR count for the day
+  const allRows    = [];
 
   for (const { game, bs } of boxscores) {
     const venue    = game.venue?.name ?? '';
@@ -1543,7 +1574,10 @@ async function fetchYesterdayResults(statcastMap = null, onProgress = null, days
         const seasonStat = player.seasonStats?.batting ?? {};
         const gameHR     = parseInt(gameStat.homeRuns, 10) || 0;
 
-        if (gameHR > 0) hrIds.add(numericId);
+        if (gameHR > 0) {
+          hrIds.add(numericId);
+          hrCountMap.set(numericId, (hrCountMap.get(numericId) ?? 0) + gameHR);
+        }
 
         const pre     = computePreGameStats(seasonStat, gameStat);
         const batSide = player.person.batSide?.code ?? 'R';
@@ -1618,11 +1652,12 @@ async function fetchYesterdayResults(statcastMap = null, onProgress = null, days
       dateStr,
       picks: allRows,
       hrIds: [...hrIds],
+      hrCountMap: [...hrCountMap.entries()],
       gameCount: completed.length,
     }));
   } catch { /* storage full or unavailable */ }
 
-  return { dateStr, picks: allRows, hrIds, gameCount: completed.length };
+  return { dateStr, picks: allRows, hrIds, hrCountMap, gameCount: completed.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,7 +1678,46 @@ function TabYesterday({ statcastMap }) {
     setProgressMsg('');
     fetchYesterdayResults(statcastMap, setProgressMsg)
       .then((data) => {
-        setState(data);
+        // Prefer yesterday's live snapshot (what the app actually showed) over the
+        // retroactive reconstruction, which omits players who were scratched.
+        const snapKey = `yardbomb_snap_${data.dateStr}`;
+        let finalData = data;
+        try {
+          const snapRaw = localStorage.getItem(snapKey);
+          if (snapRaw) {
+            const snap = JSON.parse(snapRaw);
+            if (snap.picks?.length > 0) {
+              const picks = snap.picks.map((p) => ({
+                ...p,
+                gameHR: data.hrCountMap?.get(p.id) ?? 0,
+              }));
+              finalData = { ...data, picks, usingSnapshot: true, snapSavedAt: snap.savedAt };
+
+              // Overwrite the reconstruction-based accuracy record with snapshot-based numbers
+              // so the rolling chart reflects what the app actually picked, including scratched players.
+              const top25snap = picks.slice(0, 25);
+              const hitsSnap  = top25snap.filter((p) => data.hrIds.has(p.id)).length;
+              const byGrade   = {};
+              for (const p of picks) {
+                if (!p.grade) continue;
+                if (!byGrade[p.grade]) byGrade[p.grade] = { picks: 0, hits: 0 };
+                byGrade[p.grade].picks++;
+                if (data.hrIds.has(p.id)) byGrade[p.grade].hits++;
+              }
+              saveAccuracyRecord(data.dateStr, {
+                dateStr:     data.dateStr,
+                precision:   top25snap.length > 0 ? Math.round((hitsSnap / top25snap.length) * 100) : null,
+                recall:      data.hrIds.size   > 0 ? Math.round((hitsSnap / data.hrIds.size)  * 100) : null,
+                totalHRs:    data.hrIds.size,
+                hitsInTop25: hitsSnap,
+                top25Count:  top25snap.length,
+                gameCount:   data.gameCount,
+                byGrade,
+              });
+            }
+          }
+        } catch { /* ignore — fall back to reconstruction */ }
+        setState(finalData);
         setAccuracyHistory(loadAccuracyHistory(SEASON_DAYS_ELAPSED));
         setLoading(false);
         setProgressMsg('');
@@ -1687,7 +1761,7 @@ function TabYesterday({ statcastMap }) {
   if (error)   return <p style={{ color: '#f55',  fontFamily: 'Barlow, sans-serif' }}>Error: {error}</p>;
   if (!state)  return null;
 
-  const { dateStr, picks, hrIds, gameCount } = state;
+  const { dateStr, picks, hrIds, gameCount, usingSnapshot, snapSavedAt } = state;
   const formattedDate = new Date(dateStr + 'T12:00:00').toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric',
   });
@@ -1759,8 +1833,16 @@ function TabYesterday({ statcastMap }) {
         <h2 style={{ fontFamily: 'Oswald, sans-serif', color: C.accent, letterSpacing: '0.05em', margin: 0 }}>
           {formattedDate}
         </h2>
-        <div style={{ fontFamily: 'Barlow, sans-serif', fontSize: '0.8rem', color: C.muted, marginTop: '3px' }}>
-          {gameCount} completed games
+        <div style={{ fontFamily: 'Barlow, sans-serif', fontSize: '0.8rem', color: C.muted, marginTop: '3px', display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <span>{gameCount} completed games</span>
+          {usingSnapshot
+            ? <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.68rem', padding: '1px 6px', borderRadius: '3px', background: '#1a2a1a', color: '#34d399', border: '1px solid #34d39933' }}>
+                live picks snapshot{snapSavedAt ? ` · saved ${snapSavedAt}` : ''}
+              </span>
+            : <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.68rem', padding: '1px 6px', borderRadius: '3px', background: '#1a1a2a', color: C.muted, border: `1px solid ${C.border}` }}>
+                retroactive reconstruction
+              </span>
+          }
         </div>
       </div>
 
@@ -1917,7 +1999,10 @@ function TabYesterday({ statcastMap }) {
       {view === 'Top Picks' && picks.length > 0 && (
         <>
           <div style={{ fontFamily: 'Barlow, sans-serif', fontSize: '0.75rem', color: C.muted, marginBottom: '0.75rem' }}>
-            All batters from yesterday's games, sorted by model score · green rows = actual HR · hot streak defaulted to neutral
+            {usingSnapshot
+              ? 'Live picks as shown yesterday (including scratched players) · green rows = actual HR'
+              : 'All batters from yesterday\'s games, sorted by model score · green rows = actual HR · hot streak defaulted to neutral'
+            }
           </div>
           {picks.map((p, i) => <ResultRow key={`${p.id}-${i}`} p={p} rank={i + 1} />)}
         </>
@@ -1952,7 +2037,7 @@ function TabMethodology() {
     { name: 'Power', weight: '30%', color: '#60a5fa', desc: 'Derived from SLG, Isolated Power (SLG − AVG), and HR/AB rate. Elite ceiling is .600 SLG / .300 ISO.' },
     { name: 'Pitcher Vulnerability', weight: '25%', color: '#f97316', desc: 'Four components: ERA (40%), HR/9 (30%), K/9 (15%), BB/9 (15%). ERA is blended 60% last-5-starts + 40% season — recent form matters more than the full-year line. K/9 inverted so high strikeout pitchers score less vulnerable. BB/9 captures control: a walk-prone pitcher is more hittable. Scales: ERA 1.50–6.00, HR/9 0.50–2.00, K/9 5–15 (inverted), BB/9 1.5–5.0.' },
     { name: 'Park Factor', weight: '20%', color: '#a78bfa', desc: 'Per-stadium HR index sourced from 2025 data. Great American Ball Park (+27%) is most hitter-friendly; Oracle Park (−24%) is least.' },
-    { name: 'Hot Streak', weight: '15%', color: '#34d399', desc: `Recency-weighted form score over the last ${HOT_STREAK_GAMES} games. Each game is weighted by ${STREAK_DECAY}^(games ago), so the most recent game counts ~2× more than game 10. Blends HR rate (65%) with batting average (35%) — a player on a hot hitting streak gets credit even without recent HRs. HR component: league-avg pace = 0.50, 2× avg = 1.0. AVG component: .250 = 0.50, .500 = 1.0. Requires at least ${HOT_STREAK_MIN_G} games — players below that threshold default to 0.50 (neutral).` },
+    { name: 'Hot Streak', weight: '15%', color: '#34d399', desc: `Recency-weighted form score over the last ${HOT_STREAK_GAMES} games. Each game is weighted by ${STREAK_DECAY}^(games ago), so the most recent game counts ~2× more than game 10. Blends batting average (55%) with HR rate (45%) — contact form over a sustained stretch is more stable than single-game HR count, so a player on a hot hitting streak gets meaningful credit even without recent HRs. HR component: league-avg pace = 0.50, 2× avg = 1.0. AVG component: .250 = 0.50, .500 = 1.0. Requires at least ${HOT_STREAK_MIN_G} games — players below that threshold default to 0.50 (neutral).` },
     { name: 'Platoon Advantage', weight: '10%', color: '#fbbf24', desc: 'Opposite-hand matchup (0.80) > switch hitter (0.65) > same-hand (0.40). Bat side fetched live from the MLB Stats API.' },
     { name: 'Wind Adjustment', weight: 'modifier', color: '#94a3b8', desc: 'Applied on top of the composite score after weighting. Wind out (any direction) adds up to +0.08; wind in subtracts up to −0.08; crosswind is neutral. Scaled linearly by speed — 20 mph = full effect. Sourced from the MLB live game feed at load time.' },
   ];
